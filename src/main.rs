@@ -1,4 +1,4 @@
-#![allow(dead_code, elided_named_lifetimes)]
+#![allow(dead_code, elided_lifetimes_in_paths)]
 
 use aws_credential_types::provider;
 use aws_credential_types::Credentials;
@@ -8,9 +8,10 @@ use lambda_http::{run, service_fn, tracing, Error, Body, Request, Response};
 use multipart::server::Multipart;
 use serde_json::json;
 use std::env;
-use std::io::Read;
+use std::sync::Arc;
 use std::time;
 use tokio;
+use std::io::Read;
 
 #[derive(Debug)]
 struct MyCustomProvider;
@@ -143,29 +144,35 @@ async fn handle_multipart(
 
     let mut multipart = Multipart::with_body(body, boundary);
     let mut files_info = FuturesUnordered::new();
+    let max_concurrent_uploads = 20;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_uploads));
 
-    while let Some(entry) = multipart.read_entry()? {
-        let file_bytes = entry
-            .data
-            .bytes()
-            .filter_map(|b| b.ok())
-            .collect::<Vec<u8>>();
-        // Spawn tasks for concurrent uploads
-        files_info.push(tokio::spawn(upload_file(
-            s3.clone(),
-            entry.headers.filename.unwrap_or("unknown.txt".to_string()),
-            entry
-                .headers
-                .content_type
-                .map(|ct| ct.to_string())
-                .unwrap_or("text/plain".to_string()),
-            file_bytes,
-        )));
+    while let Some(mut entry) = multipart.read_entry()? {
+        let mut file_bytes = Vec::new();
+        entry.data.read_to_end(&mut file_bytes)?;
+
+        let file_name = entry
+            .headers
+            .filename
+            .unwrap_or_else(|| "unknown.txt".to_string());
+        let content_type = entry
+            .headers
+            .content_type
+            .map(|ct| ct.to_string())
+            .unwrap_or_else(|| "text/plain".to_string());
+
+        let s3_clone = s3.clone();
+        let permit = semaphore.clone().acquire_owned().await?;
+
+        files_info.push(tokio::spawn(async move {
+            let _permit = permit;
+            upload_file(s3_clone, file_name, content_type, file_bytes).await
+        }));
     }
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     while let Some(result) = files_info.next().await {
-        results.push(result.unwrap());
+        results.push(result?);
     }
 
     Ok(Response::builder().status(200).body(
